@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8"/>
+    <title>Ceph Tiering Demo</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"/>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <!-- Include Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+      body {
+        background-color: #f8f9fa;
+      }
+      .ceph-header {
+        background-color: #f8f9fa;
+        text-align: center;
+        padding: 20px;
+        margin-bottom: 20px;
+      }
+      .ceph-header img {
+        height: 80px;
+      }
+      /* Make the charts smaller / consistent size */
+      .chart-box {
+        max-width: 400px;
+        margin: 0 auto;
+        height: 300px;
+      }
+
+      /* Color-code classes */
+      .sc-standard {
+        color: green;
+        font-weight: bold;
+      }
+      .sc-ibm-cloud {
+        color: blue;
+        font-weight: bold;
+      }
+      .sc-point {
+        color: red;
+        font-weight: bold;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div class="ceph-header">
+      <img src="https://ceph.io/assets/bitmaps/Ceph_Logo_Standard_RGB_Black_120411_fa.png" alt="Ceph Logo">
+      <h3 class="mt-3">Ceph Tiering Demo</h3>
+      <p class="mb-0">Bucket: <strong>{{ bucket_name }}</strong> | Endpoint: <strong>{{ rgw_endpoint }}</strong></p>
+    </div>
+
+    <div class="container">
+      <!-- Flash Messages -->
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          {% for category, message in messages %}
+            <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+              {{ message }}
+              <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+          {% endfor %}
+        {% endif %}
+      {% endwith %}
+
+      <!-- File Upload Form -->
+      <div class="card mb-4">
+        <div class="card-body">
+          <h5 class="card-title">Upload a File</h5>
+          <form method="post" enctype="multipart/form-data">
+            <div class="mb-3">
+              <input class="form-control" type="file" id="file" name="file"/>
+            </div>
+            <button type="submit" class="btn btn-primary">Upload</button>
+          </form>
+        </div>
+      </div>
+
+      <!-- Objects Table -->
+      <div class="card mb-4">
+        <div class="card-body">
+          <h5 class="card-title">Objects in Bucket</h5>
+          <table class="table table-striped">
+            <thead>
+              <tr>
+                <th>Key</th>
+                <th>Last Modified</th>
+                <th>Size (Bytes)</th>
+                <th>Storage Class</th>
+                <th>Preview</th>
+              </tr>
+            </thead>
+            <tbody id="filelist-body">
+              {% if objects %}
+                {% for obj in objects %}
+                  <tr>
+                    <td>{{ obj.Key }}</td>
+                    <td>{{ obj.LastModified }}</td>
+                    <td>{{ obj.Size }}</td>
+                    <td>
+                      <!-- We'll do color-coding dynamically in JS for auto-refresh,
+                           so here's a fallback if no refresh has happened yet. -->
+                      {% if obj.StorageClass == "STANDARD" %}
+                        <span class="sc-standard">STANDARD</span>
+                      {% elif obj.StorageClass == "ibm-cloud" %}
+                        <span class="sc-ibm-cloud">ibm-cloud</span>
+                      {% elif obj.StorageClass.startswith("point") %}
+                        <span class="sc-point">{{ obj.StorageClass }}</span>
+                      {% else %}
+                        {{ obj.StorageClass }}
+                      {% endif %}
+                    </td>
+                    <td>
+                      <a href="/preview/{{ obj.Key }}" target="_blank" class="btn btn-sm btn-secondary">View</a>
+                    </td>
+                  </tr>
+                {% endfor %}
+              {% else %}
+                <tr><td colspan="5" class="text-center">No files in bucket.</td></tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Charts Row (Bar + Doughnut) -->
+      <div class="row">
+        <div class="col-md-6 mb-4">
+          <div class="card">
+            <div class="card-body">
+              <h5 class="card-title">Storage Class Distribution</h5>
+              <div class="chart-box">
+                <canvas id="scBarChart"></canvas>
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        <div class="col-md-6 mb-4">
+          <div class="card">
+            <div class="card-body">
+              <h5 class="card-title">Bucket Usage</h5>
+              <div class="chart-box">
+                <canvas id="usageDoughnut"></canvas>
+              </div>
+              <p class="mt-3">
+                Used: <strong>{{ used_mb }}</strong> MB out of <strong>{{ bucket_quota_mb }}</strong> MB
+                ({{ usage_percentage|round(2) }}%).
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Script Section for Real-Time Updates -->
+    <script>
+      // Grab initial data from Jinja for the chart defaults
+      let scCounts = {{ sc_counts|tojson }};
+      let usedMB = {{ used_mb }};
+      let bucketQuotaMB = {{ bucket_quota_mb }};
+      let usagePercentage = {{ usage_percentage|round(2) }};
+
+      // Prepare data arrays
+      let scLabels = Object.keys(scCounts);
+      let scData = Object.values(scCounts);
+
+      // Chart.js: Bar Chart for StorageClass Distribution
+      const scBarCtx = document.getElementById('scBarChart').getContext('2d');
+      let scBarChart = new Chart(scBarCtx, {
+        type: 'bar',
+        data: {
+          labels: scLabels,
+          datasets: [{
+            label: 'Object Count',
+            data: scData,
+            borderWidth: 1
+          }]
+        },
+        options: {
+          scales: {
+            y: { beginAtZero: true }
+          }
+        }
+      });
+
+      // Chart.js: Doughnut Chart for Used vs. Free
+      const usageDoughnutCtx = document.getElementById('usageDoughnut').getContext('2d');
+      let usageDoughnut = new Chart(usageDoughnutCtx, {
+        type: 'doughnut',
+        data: {
+          labels: ['Used (MB)', 'Free (MB)'],
+          datasets: [{
+            data: [usedMB, Math.max(bucketQuotaMB - usedMB, 0)],
+            borderWidth: 1
+          }]
+        },
+        options: {
+          plugins: {
+            tooltip: {
+              callbacks: {
+                label: function(context) {
+                  return context.label + ': ' + context.parsed + ' MB';
+                }
+              }
+            }
+          }
+        }
+      });
+
+      // Helper function to color-code StorageClass
+      function getStorageClassHTML(sc) {
+        if (sc === "STANDARD") {
+          return '<span class="sc-standard">STANDARD</span>';
+        } else if (sc === "ibm-cloud") {
+          return '<span class="sc-ibm-cloud">ibm-cloud</span>';
+        } else if (sc.startsWith("point")) {
+          // e.g. "point-tape"
+          return `<span class="sc-point">${sc}</span>`;
+        } else {
+          return sc;  // fallback
+        }
+      }
+
+      // Function to update the file list
+      async function refreshFileList() {
+        try {
+          const res = await fetch('/api/filelist');
+          const objects = await res.json();
+          const tbody = document.getElementById('filelist-body');
+
+          if (!objects || objects.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" class="text-center">No files in bucket.</td></tr>';
+            return;
+          }
+
+          let html = '';
+          objects.forEach(obj => {
+            const scHTML = getStorageClassHTML(obj.StorageClass);
+            html += `
+              <tr>
+                <td>${obj.Key}</td>
+                <td>${obj.LastModified}</td>
+                <td>${obj.Size}</td>
+                <td>${scHTML}</td>
+                <td>
+                  <a href="/preview/${obj.Key}" target="_blank" class="btn btn-sm btn-secondary">View</a>
+                </td>
+              </tr>`;
+          });
+          tbody.innerHTML = html;
+        } catch (err) {
+          console.error('Error refreshing file list:', err);
+        }
+      }
+
+      // Function to update charts
+      async function refreshCharts() {
+        try {
+          const res = await fetch('/api/summary');
+          const summary = await res.json();
+
+          // 1) Update bar chart data
+          scCounts = summary.sc_counts || {};
+          scLabels = Object.keys(scCounts);
+          scData = Object.values(scCounts);
+
+          scBarChart.data.labels = scLabels;
+          scBarChart.data.datasets[0].data = scData;
+          scBarChart.update();
+
+          // 2) Update usage doughnut
+          usedMB = summary.used_mb;
+          bucketQuotaMB = summary.bucket_quota_mb;
+          usagePercentage = summary.usage_percentage;
+
+          usageDoughnut.data.datasets[0].data = [usedMB, Math.max(bucketQuotaMB - usedMB, 0)];
+          usageDoughnut.update();
+        } catch (err) {
+          console.error('Error refreshing charts:', err);
+        }
+      }
+
+      // Auto-refresh the file list & charts every 10 seconds
+      setInterval(() => {
+        refreshFileList();
+        refreshCharts();
+      }, 10000);
+    </script>
+  </body>
+</html>
+
